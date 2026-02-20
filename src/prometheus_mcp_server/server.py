@@ -453,9 +453,73 @@ async def list_metrics(
 
     return result
 
+def _coerce_metadata_entries(value: Any) -> List[Dict[str, Any]]:
+    """Normalize metadata value into a list of metadata dictionaries."""
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
+def _normalize_metadata_map(raw_data: Any) -> Dict[str, List[Dict[str, Any]]]:
+    """Normalize diverse metadata response shapes into {metric_name: [entries]}."""
+    if isinstance(raw_data, dict):
+        if "metadata" in raw_data:
+            return _normalize_metadata_map(raw_data["metadata"])
+        if "data" in raw_data:
+            return _normalize_metadata_map(raw_data["data"])
+
+        normalized: Dict[str, List[Dict[str, Any]]] = {}
+        for metric_name, entries in raw_data.items():
+            if not isinstance(metric_name, str):
+                continue
+            coerced_entries = _coerce_metadata_entries(entries)
+            if coerced_entries:
+                normalized[metric_name] = coerced_entries
+
+        if normalized:
+            return normalized
+
+        metric_name = raw_data.get("metric")
+        if isinstance(metric_name, str):
+            return {metric_name: [raw_data]}
+
+    if isinstance(raw_data, list):
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for entry in raw_data:
+            if not isinstance(entry, dict):
+                continue
+            metric_name = entry.get("metric")
+            if not isinstance(metric_name, str):
+                continue
+            grouped.setdefault(metric_name, []).append(entry)
+        return grouped
+
+    return {}
+
+
+def _metadata_matches_pattern(metric_name: str, entries: List[Dict[str, Any]], pattern: str) -> bool:
+    """Return True when pattern matches metric name or metadata text fields."""
+    lowered_pattern = pattern.lower()
+    if lowered_pattern in metric_name.lower():
+        return True
+
+    for entry in entries:
+        for value in entry.values():
+            if isinstance(value, str) and lowered_pattern in value.lower():
+                return True
+
+    return False
+
+
 @mcp.tool(
     name=_tool_name("get_metric_metadata"),
-    description="Get metadata for a specific metric",
+    description=(
+        "Get metadata (type, help, unit) for metrics. "
+        "Returns all metric metadata when no metric name is provided. "
+        "Use filter_pattern to search metric names and descriptions."
+    ),
     annotations={
         "title": "Get Metric Metadata",
         "icon": "ℹ️",
@@ -465,28 +529,73 @@ async def list_metrics(
         "openWorldHint": True
     }
 )
-async def get_metric_metadata(metric: str) -> List[Dict[str, Any]]:
-    """Get metadata about a specific metric.
+async def get_metric_metadata(
+    metric: Optional[str] = None,
+    filter_pattern: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+    """Get metadata for one metric or bulk metadata for all metrics.
 
     Args:
-        metric: The name of the metric to retrieve metadata for
+        metric: Optional metric name. If provided, returns legacy list format.
+        filter_pattern: Optional substring filter on metric name and descriptions.
+        limit: Maximum number of metrics to return in bulk mode.
+        offset: Number of metrics to skip in bulk mode.
 
     Returns:
-        List of metadata entries for the metric
+        If metric is provided: list of metadata entries for that metric.
+        If metric is not provided: dict with filtered metadata and pagination info.
     """
-    logger.info("Retrieving metric metadata", metric=metric)
-    endpoint = f"metadata?metric={metric}"
-    data = make_prometheus_request(endpoint, params=None)
-    if "metadata" in data:
-        metadata = data["metadata"]
-    elif "data" in data:
-        metadata = data["data"]
-    else:
-        metadata = data
-    if isinstance(metadata, dict):
-        metadata = [metadata]
-    logger.info("Metric metadata retrieved", metric=metric, metadata_count=len(metadata))
-    return metadata
+    logger.info("Retrieving metric metadata", metric=metric, filter_pattern=filter_pattern, limit=limit, offset=offset)
+
+    params = {"metric": metric} if metric else None
+    raw_data = make_prometheus_request("metadata", params=params)
+
+    metadata_by_metric = _normalize_metadata_map(raw_data)
+
+    # Fallback for atypical single-metric response formats.
+    if metric and metric not in metadata_by_metric:
+        fallback_entries = _coerce_metadata_entries(raw_data)
+        if fallback_entries:
+            metadata_by_metric[metric] = fallback_entries
+
+    if filter_pattern:
+        metadata_by_metric = {
+            metric_name: entries
+            for metric_name, entries in metadata_by_metric.items()
+            if _metadata_matches_pattern(metric_name, entries, filter_pattern)
+        }
+
+    if metric:
+        metric_entries = metadata_by_metric.get(metric, [])
+        logger.info("Metric metadata retrieved", metric=metric, metadata_count=len(metric_entries))
+        return metric_entries
+
+    metric_names = list(metadata_by_metric.keys())
+    total_count = len(metric_names)
+    start_idx = offset
+    end_idx = offset + limit if limit is not None else total_count
+    selected_metric_names = metric_names[start_idx:end_idx]
+    paginated_metadata = {name: metadata_by_metric[name] for name in selected_metric_names}
+
+    result = {
+        "metadata": paginated_metadata,
+        "total_count": total_count,
+        "returned_count": len(paginated_metadata),
+        "offset": offset,
+        "has_more": end_idx < total_count,
+    }
+
+    logger.info(
+        "Bulk metric metadata retrieved",
+        total_count=total_count,
+        returned_count=result["returned_count"],
+        offset=offset,
+        has_more=result["has_more"],
+    )
+
+    return result
 
 @mcp.tool(
     name=_tool_name("get_targets"),

@@ -146,7 +146,7 @@ docker run -i --rm \
 | `execute_query` | Query | Execute a PromQL instant query against Prometheus |
 | `execute_range_query` | Query | Execute a PromQL range query with start time, end time, and step interval |
 | `list_metrics` | Discovery | List all available metrics in Prometheus with pagination and filtering support |
-| `get_metric_metadata` | Discovery | Get metadata for a specific metric |
+| `get_metric_metadata` | Discovery | Get metadata for one metric or bulk metadata with optional filtering |
 | `get_targets` | Discovery | Get information about all scrape targets |
 
 The list of tools is configurable, so you can choose which tools you want to make available to the MCP client. This is useful if you don't use certain functionality or if you don't want to take up too much of the context window.
@@ -157,6 +157,7 @@ The list of tools is configurable, so you can choose which tools you want to mak
 - Discover and explore metrics
   - List available metrics
   - Get metadata for specific metrics
+  - Search metric metadata by name or description in a single call
   - View instant query results
   - View range query results with different step intervals
 - Authentication support

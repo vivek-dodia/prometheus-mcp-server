@@ -4,7 +4,10 @@ import pytest
 import json
 from unittest.mock import patch, MagicMock
 from fastmcp import Client
-from prometheus_mcp_server.server import mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets
+from prometheus_mcp_server.server import (
+    mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
+    _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
+)
 
 @pytest.fixture
 def mock_make_request():
@@ -160,13 +163,78 @@ async def test_get_metric_metadata(mock_make_request):
 
         payload = result.content[0].text
         json_data = json.loads(payload)
-        print(json_data)
 
         # Verify
-        mock_make_request.assert_called_once_with("metadata?metric=up", params=None)
+        mock_make_request.assert_called_once_with("metadata", params={"metric": "up"})
         assert len(json_data) == 1
         assert json_data[0]["metric"] == "up"
         assert json_data[0]["type"] == "gauge"
+
+@pytest.mark.asyncio
+async def test_get_metric_metadata_bulk(mock_make_request):
+    """Test get_metric_metadata bulk mode without metric filter."""
+    mock_make_request.return_value = {
+        "up": [{"type": "gauge", "help": "Target availability", "unit": ""}],
+        "tls_expiry_seconds": [{"type": "gauge", "help": "Seconds until certificate expiry", "unit": "seconds"}],
+        "process_cpu_seconds_total": [{"type": "counter", "help": "Total CPU seconds", "unit": "seconds"}],
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_metric_metadata", {})
+
+        payload = result.content[0].text
+        json_data = json.loads(payload)
+
+        mock_make_request.assert_called_once_with("metadata", params=None)
+        assert json_data["total_count"] == 3
+        assert json_data["returned_count"] == 3
+        assert json_data["offset"] == 0
+        assert json_data["has_more"] is False
+        assert "tls_expiry_seconds" in json_data["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_get_metric_metadata_filter_matches_description(mock_make_request):
+    """Test get_metric_metadata filter_pattern on metadata descriptions."""
+    mock_make_request.return_value = {
+        "tls_expiry_seconds": [{"type": "gauge", "help": "Seconds until certificate expiry", "unit": "seconds"}],
+        "process_cpu_seconds_total": [{"type": "counter", "help": "Total CPU seconds", "unit": "seconds"}],
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_metric_metadata", {"filter_pattern": "certificate"})
+
+        payload = result.content[0].text
+        json_data = json.loads(payload)
+
+        mock_make_request.assert_called_once_with("metadata", params=None)
+        assert json_data["total_count"] == 1
+        assert "tls_expiry_seconds" in json_data["metadata"]
+        assert "process_cpu_seconds_total" not in json_data["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_get_metric_metadata_bulk_pagination(mock_make_request):
+    """Test get_metric_metadata bulk pagination."""
+    mock_make_request.return_value = {
+        "metric_a": [{"type": "gauge", "help": "A", "unit": ""}],
+        "metric_b": [{"type": "gauge", "help": "B", "unit": ""}],
+        "metric_c": [{"type": "gauge", "help": "C", "unit": ""}],
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_metric_metadata", {"limit": 1, "offset": 1})
+
+        payload = result.content[0].text
+        json_data = json.loads(payload)
+
+        mock_make_request.assert_called_once_with("metadata", params=None)
+        assert json_data["total_count"] == 3
+        assert json_data["returned_count"] == 1
+        assert json_data["offset"] == 1
+        assert json_data["has_more"] is True
+        assert list(json_data["metadata"].keys()) == ["metric_b"]
+
 
 @pytest.mark.asyncio
 async def test_get_targets(mock_make_request):
@@ -191,3 +259,127 @@ async def test_get_targets(mock_make_request):
         assert len(json_data["activeTargets"]) == 1
         assert json_data["activeTargets"][0]["health"] == "up"
         assert len(json_data["droppedTargets"]) == 0
+
+
+# --- Helper function unit tests ---
+
+class TestCoerceMetadataEntries:
+    """Tests for _coerce_metadata_entries edge cases."""
+
+    def test_with_dict_value(self):
+        """A single dict should be wrapped in a list."""
+        result = _coerce_metadata_entries({"type": "gauge", "help": "Up"})
+        assert result == [{"type": "gauge", "help": "Up"}]
+
+    def test_with_unsupported_type(self):
+        """Non-dict/non-list values should return empty list."""
+        assert _coerce_metadata_entries("string") == []
+        assert _coerce_metadata_entries(42) == []
+        assert _coerce_metadata_entries(None) == []
+
+
+class TestNormalizeMetadataMap:
+    """Tests for _normalize_metadata_map edge cases."""
+
+    def test_skips_non_string_keys(self):
+        """Non-string dict keys should be ignored."""
+        data = {"up": [{"type": "gauge"}]}
+        data[123] = [{"type": "counter"}]
+        result = _normalize_metadata_map(data)
+        assert list(result.keys()) == ["up"]
+
+    def test_dict_no_normalizable_entries_no_metric_key(self):
+        """Dict with no coercible entries and no 'metric' key returns empty."""
+        result = _normalize_metadata_map({"foo": "bar", "baz": 42})
+        assert result == {}
+
+    def test_list_skips_non_dict_entries(self):
+        """Non-dict items in a list should be skipped."""
+        result = _normalize_metadata_map([
+            "not_a_dict",
+            {"metric": "up", "type": "gauge"},
+        ])
+        assert list(result.keys()) == ["up"]
+
+    def test_list_skips_entries_without_metric_key(self):
+        """Dict entries without a 'metric' string key should be skipped."""
+        result = _normalize_metadata_map([
+            {"type": "gauge"},
+            {"metric": "up", "type": "gauge"},
+        ])
+        assert list(result.keys()) == ["up"]
+
+    def test_unsupported_type_returns_empty(self):
+        """Non-dict/non-list input should return empty dict."""
+        assert _normalize_metadata_map("string") == {}
+        assert _normalize_metadata_map(42) == {}
+        assert _normalize_metadata_map(None) == {}
+
+
+class TestMetadataMatchesPattern:
+    """Tests for _metadata_matches_pattern edge cases."""
+
+    def test_matches_metric_name(self):
+        """Pattern matching on metric name should return True."""
+        assert _metadata_matches_pattern(
+            "http_requests_total", [{"type": "counter"}], "http"
+        ) is True
+
+    def test_no_match(self):
+        """Non-matching pattern should return False."""
+        assert _metadata_matches_pattern(
+            "up", [{"type": "gauge", "help": "availability"}], "http"
+        ) is False
+
+
+# --- MCP tool integration tests for edge cases ---
+
+@pytest.mark.asyncio
+async def test_get_metric_metadata_dict_entries(mock_make_request):
+    """Test bulk mode when metadata values are dicts instead of lists."""
+    mock_make_request.return_value = {
+        "up": {"type": "gauge", "help": "Target availability", "unit": ""},
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_metric_metadata", {})
+        payload = result.content[0].text
+        json_data = json.loads(payload)
+
+        assert json_data["total_count"] == 1
+        assert "up" in json_data["metadata"]
+        assert json_data["metadata"]["up"] == [{"type": "gauge", "help": "Target availability", "unit": ""}]
+
+
+@pytest.mark.asyncio
+async def test_get_metric_metadata_filter_matches_name(mock_make_request):
+    """Test filter_pattern matching on metric name (not description)."""
+    mock_make_request.return_value = {
+        "http_requests_total": [{"type": "counter", "help": "Total requests", "unit": ""}],
+        "go_goroutines": [{"type": "gauge", "help": "Number of goroutines", "unit": ""}],
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_metric_metadata", {"filter_pattern": "http"})
+        payload = result.content[0].text
+        json_data = json.loads(payload)
+
+        assert json_data["total_count"] == 1
+        assert "http_requests_total" in json_data["metadata"]
+        assert "go_goroutines" not in json_data["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_get_metric_metadata_fallback_entries(mock_make_request):
+    """Test fallback when metric is not found in normalized map."""
+    mock_make_request.return_value = [
+        {"type": "gauge", "help": "Up status", "unit": ""}
+    ]
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_metric_metadata", {"metric": "up"})
+        payload = result.content[0].text
+        json_data = json.loads(payload)
+
+        assert len(json_data) == 1
+        assert json_data[0]["type"] == "gauge"
